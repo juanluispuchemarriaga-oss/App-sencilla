@@ -118,7 +118,11 @@ jobs:
                           android:value="avisos de la hora" />
                   </service>
 
-                  <receiver android:name=".HourReceiver" android:exported="false" />
+                  <receiver android:name=".HourReceiver" android:exported="false">
+                      <intent-filter>
+                          <action android:name="com.horavoz.app.HORA" />
+                      </intent-filter>
+                  </receiver>
 
                   <receiver android:name=".BootReceiver" android:exported="true">
                       <intent-filter>
@@ -140,11 +144,13 @@ jobs:
           import java.util.Calendar
 
           object Scheduler {
+              const val ACTION = "com.horavoz.app.HORA"
               private const val PREFS = "horavoz"
               private const val KEY_ON = "activo"
 
               private fun pending(ctx: Context): PendingIntent {
-                  val i = Intent(ctx, HourReceiver::class.java)
+                  val i = Intent(ACTION)
+                  i.setPackage(ctx.packageName)
                   return PendingIntent.getBroadcast(
                       ctx, 1, i,
                       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -152,7 +158,8 @@ jobs:
               }
 
               private fun pendingTest(ctx: Context): PendingIntent {
-                  val i = Intent(ctx, HourReceiver::class.java)
+                  val i = Intent(ACTION)
+                  i.setPackage(ctx.packageName)
                   i.putExtra("test", true)
                   return PendingIntent.getBroadcast(
                       ctx, 2, i,
@@ -167,8 +174,6 @@ jobs:
                   ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ON, on).apply()
               }
 
-              // Se programa como "alarma de reloj": es lo mas fiable, el sistema la respeta
-              // aunque el telefono este en reposo o la app este cerrada.
               private fun setAt(ctx: Context, t: Long, p: PendingIntent) {
                   val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
                   val show = PendingIntent.getActivity(
@@ -221,7 +226,9 @@ jobs:
           import android.os.Looper
           import android.speech.tts.TextToSpeech
           import android.speech.tts.UtteranceProgressListener
+          import java.text.SimpleDateFormat
           import java.util.Calendar
+          import java.util.Date
           import java.util.Locale
           import java.util.concurrent.atomic.AtomicBoolean
 
@@ -244,6 +251,31 @@ jobs:
                       else -> "de la noche"
                   }
                   return "$verbo $n $momento"
+              }
+
+              // Lo llaman la alarma (receptor del manifiesto) y el servicio (receptor dinamico).
+              // Si llegan los dos, solo se anuncia una vez.
+              fun handle(app: Context, intent: Intent, done: () -> Unit) {
+                  val test = intent.getBooleanExtra("test", false)
+                  val prefs = app.getSharedPreferences("horavoz", Context.MODE_PRIVATE)
+                  val ahora = Date()
+                  val marca = SimpleDateFormat("d MMM HH:mm:ss", Locale("es")).format(ahora)
+                  prefs.edit().putString("ultimo", if (test) marca + " (prueba)" else marca).apply()
+                  if (!test) {
+                      if (!Scheduler.isOn(app)) {
+                          done()
+                          return
+                      }
+                      Scheduler.scheduleNext(app)
+                  }
+                  val formato = if (test) "yyyyMMddHHmm" else "yyyyMMddHH"
+                  val clave = (if (test) "T" else "H") + SimpleDateFormat(formato, Locale.US).format(ahora)
+                  if (prefs.getString("clave", "") == clave) {
+                      done()
+                      return
+                  }
+                  prefs.edit().putString("clave", clave).apply()
+                  run(app, done)
               }
 
               fun run(ctx: Context, done: () -> Unit) {
@@ -317,14 +349,9 @@ jobs:
           class HourReceiver : BroadcastReceiver() {
               override fun onReceive(context: Context, intent: Intent) {
                   val app = context.applicationContext
-                  val test = intent.getBooleanExtra("test", false)
-                  if (!test) {
-                      if (!Scheduler.isOn(app)) return
-                      Scheduler.scheduleNext(app)
-                      try { Scheduler.startService(app) } catch (e: Exception) { }
-                  }
                   val pr = goAsync()
-                  Announcer.run(app) { pr.finish() }
+                  Announcer.handle(app, intent) { pr.finish() }
+                  try { Scheduler.startService(app) } catch (e: Exception) { }
               }
           }
           EOF
@@ -337,14 +364,39 @@ jobs:
           import android.app.NotificationManager
           import android.app.PendingIntent
           import android.app.Service
+          import android.content.BroadcastReceiver
           import android.content.Context
           import android.content.Intent
+          import android.content.IntentFilter
           import android.content.pm.ServiceInfo
           import android.os.Build
           import android.os.IBinder
 
           class KeepAliveService : Service() {
+              private var rx: BroadcastReceiver? = null
+
               override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val r = object : BroadcastReceiver() {
+                      override fun onReceive(c: Context, i: Intent) {
+                          Announcer.handle(applicationContext, i) { }
+                      }
+                  }
+                  val f = IntentFilter(Scheduler.ACTION)
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      registerReceiver(r, f, Context.RECEIVER_NOT_EXPORTED)
+                  } else {
+                      registerReceiver(r, f)
+                  }
+                  rx = r
+              }
+
+              override fun onDestroy() {
+                  try { unregisterReceiver(rx) } catch (e: Exception) { }
+                  super.onDestroy()
+              }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -395,19 +447,30 @@ jobs:
 
           import android.Manifest
           import android.app.Activity
+          import android.app.AlarmManager
+          import android.app.NotificationManager
+          import android.content.Context
           import android.content.Intent
           import android.content.pm.PackageManager
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
+          import android.os.PowerManager
           import android.provider.Settings
           import android.widget.Button
           import android.widget.LinearLayout
           import android.widget.ScrollView
           import android.widget.TextView
           import android.widget.Toast
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
 
           class MainActivity : Activity() {
+              private lateinit var estado: TextView
+              private lateinit var diag: TextView
+              private lateinit var btn: Button
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
 
@@ -421,39 +484,35 @@ jobs:
                   layout.orientation = LinearLayout.VERTICAL
                   layout.setPadding(48, 120, 48, 48)
 
-                  val estado = TextView(this)
+                  estado = TextView(this)
                   estado.textSize = 22f
-                  estado.setPadding(0, 0, 0, 48)
+                  estado.setPadding(0, 0, 0, 24)
 
-                  val btn = Button(this)
+                  diag = TextView(this)
+                  diag.textSize = 14f
+                  diag.setPadding(0, 0, 0, 32)
+
+                  btn = Button(this)
                   val prueba = Button(this)
                   prueba.text = "Probar ahora (voz + notificación)"
                   val unMin = Button(this)
                   unMin.text = "Probar en 1 minuto (sal de la app)"
+                  val actualizar = Button(this)
+                  actualizar.text = "Actualizar diagnóstico"
                   val bateria = Button(this)
                   bateria.text = "Ajustes de batería (recomendado)"
                   val ajustes = Button(this)
                   ajustes.text = "Ajustes de la app (permisos)"
 
-                  fun refrescar() {
-                      if (Scheduler.isOn(this)) {
-                          estado.text = "✅ Avisos ACTIVADOS\nTe aviso cada hora en punto."
-                          btn.text = "Desactivar avisos"
-                      } else {
-                          estado.text = "⏸️ Avisos APAGADOS"
-                          btn.text = "Activar avisos"
-                      }
-                  }
-
                   btn.setOnClickListener {
                       if (Scheduler.isOn(this)) {
                           Scheduler.setOn(this, false)
                           Scheduler.cancel(this)
-                      Scheduler.stopService(this)
+                          Scheduler.stopService(this)
                       } else {
                           Scheduler.setOn(this, true)
                           Scheduler.scheduleNext(this)
-                      Scheduler.startService(this)
+                          Scheduler.startService(this)
                       }
                       refrescar()
                   }
@@ -465,7 +524,10 @@ jobs:
                   unMin.setOnClickListener {
                       Scheduler.scheduleTest(this)
                       Toast.makeText(this, "Sal de la app. En 1 minuto debe sonar.", Toast.LENGTH_LONG).show()
+                      refrescar()
                   }
+
+                  actualizar.setOnClickListener { refrescar() }
 
                   bateria.setOnClickListener {
                       startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
@@ -478,17 +540,51 @@ jobs:
                   }
 
                   layout.addView(estado)
+                  layout.addView(diag)
                   layout.addView(btn)
                   layout.addView(prueba)
                   layout.addView(unMin)
+                  layout.addView(actualizar)
                   layout.addView(bateria)
                   layout.addView(ajustes)
 
                   val scroll = ScrollView(this)
                   scroll.addView(layout)
                   setContentView(scroll)
-                  if (Scheduler.isOn(this)) { try { Scheduler.startService(this) } catch (e: Exception) { } }
+                  if (Scheduler.isOn(this)) {
+                      try { Scheduler.startService(this) } catch (e: Exception) { }
+                  }
                   refrescar()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refrescar()
+              }
+
+              private fun refrescar() {
+                  if (Scheduler.isOn(this)) {
+                      estado.text = "✅ Avisos ACTIVADOS\nTe aviso cada hora en punto."
+                      btn.text = "Desactivar avisos"
+                  } else {
+                      estado.text = "⏸️ Avisos APAGADOS"
+                      btn.text = "Activar avisos"
+                  }
+                  val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                  val fmt = SimpleDateFormat("d MMM HH:mm:ss", Locale("es"))
+                  val info = am.nextAlarmClock
+                  val prox = if (info != null) fmt.format(Date(info.triggerTime)) else "ninguna"
+                  val ultimo = getSharedPreferences("horavoz", Context.MODE_PRIVATE).getString("ultimo", "nunca")
+                  val notif = if (nm.areNotificationsEnabled()) "sí" else "NO"
+                  val bat = if (pm.isIgnoringBatteryOptimizations(packageName)) "sí" else "NO"
+                  diag.text = "DIAGNÓSTICO\n" +
+                      "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n" +
+                      "Notificaciones permitidas: " + notif + "\n" +
+                      "Batería sin restricción: " + bat + "\n" +
+                      "Próxima alarma: " + prox + "\n" +
+                      "Último aviso recibido: " + ultimo
               }
           }
           EOF
