@@ -91,6 +91,7 @@ jobs:
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
 
               <queries>
                   <intent>
@@ -192,7 +193,9 @@ jobs:
               }
 
               fun scheduleTest(ctx: Context) {
-                  setAt(ctx, System.currentTimeMillis() + 60000, pendingTest(ctx))
+                  val t = System.currentTimeMillis() + 60000
+                  ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putLong("pruebaEn", t).apply()
+                  setAt(ctx, t, pendingTest(ctx))
               }
 
               fun startService(ctx: Context) {
@@ -370,15 +373,64 @@ jobs:
           import android.content.IntentFilter
           import android.content.pm.ServiceInfo
           import android.os.Build
+          import android.os.Handler
           import android.os.IBinder
+          import android.os.Looper
+          import android.os.PowerManager
+          import java.text.SimpleDateFormat
+          import java.util.Calendar
+          import java.util.Locale
 
           class KeepAliveService : Service() {
+              companion object {
+                  @Volatile
+                  var latido = 0L
+              }
+
               private var rx: BroadcastReceiver? = null
+              private var wl: PowerManager.WakeLock? = null
+              private val handler = Handler(Looper.getMainLooper())
+              private var claveHora = ""
+
+              // Cada 5 segundos mira el reloj del telefono.
+              private val ciclo = object : Runnable {
+                  override fun run() {
+                      try { revisar() } catch (e: Exception) { }
+                      handler.postDelayed(this, 5000)
+                  }
+              }
+
+              private fun revisar() {
+                  val ahora = System.currentTimeMillis()
+                  latido = ahora
+                  val app = applicationContext
+                  val prefs = app.getSharedPreferences("horavoz", Context.MODE_PRIVATE)
+                  val c = Calendar.getInstance()
+                  if (c.get(Calendar.MINUTE) == 0) {
+                      val clave = SimpleDateFormat("yyyyMMddHH", Locale.US).format(c.time)
+                      if (clave != claveHora) {
+                          claveHora = clave
+                          Announcer.handle(app, Intent(Scheduler.ACTION)) { }
+                      }
+                  }
+                  val pe = prefs.getLong("pruebaEn", 0L)
+                  if (pe > 0L && ahora >= pe) {
+                      prefs.edit().putLong("pruebaEn", 0L).apply()
+                      val i = Intent(Scheduler.ACTION)
+                      i.putExtra("test", true)
+                      Announcer.handle(app, i) { }
+                  }
+              }
 
               override fun onBind(intent: Intent?): IBinder? = null
 
               override fun onCreate() {
                   super.onCreate()
+                  val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                  val lock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "horavoz:servicio")
+                  lock.acquire()
+                  wl = lock
+
                   val r = object : BroadcastReceiver() {
                       override fun onReceive(c: Context, i: Intent) {
                           Announcer.handle(applicationContext, i) { }
@@ -391,10 +443,18 @@ jobs:
                       registerReceiver(r, f)
                   }
                   rx = r
+
+                  handler.post(ciclo)
               }
 
               override fun onDestroy() {
+                  handler.removeCallbacks(ciclo)
+                  latido = 0L
                   try { unregisterReceiver(rx) } catch (e: Exception) { }
+                  try {
+                      val lock = wl
+                      if (lock != null && lock.isHeld) lock.release()
+                  } catch (e: Exception) { }
                   super.onDestroy()
               }
 
@@ -522,8 +582,12 @@ jobs:
                   }
 
                   unMin.setOnClickListener {
-                      Scheduler.scheduleTest(this)
-                      Toast.makeText(this, "Sal de la app. En 1 minuto debe sonar.", Toast.LENGTH_LONG).show()
+                      if (Scheduler.isOn(this)) {
+                          Scheduler.scheduleTest(this)
+                          Toast.makeText(this, "Sal de la app. En 1 minuto debe sonar.", Toast.LENGTH_LONG).show()
+                      } else {
+                          Toast.makeText(this, "Primero toca Activar avisos.", Toast.LENGTH_LONG).show()
+                      }
                       refrescar()
                   }
 
@@ -579,7 +643,10 @@ jobs:
                   val ultimo = getSharedPreferences("horavoz", Context.MODE_PRIVATE).getString("ultimo", "nunca")
                   val notif = if (nm.areNotificationsEnabled()) "sí" else "NO"
                   val bat = if (pm.isIgnoringBatteryOptimizations(packageName)) "sí" else "NO"
+                  val lat = KeepAliveService.latido
+                  val srv = if (lat == 0L) "detenido" else "vivo (hace " + ((System.currentTimeMillis() - lat) / 1000) + " s)"
                   diag.text = "DIAGNÓSTICO\n" +
+                      "Servicio: " + srv + "\n" +
                       "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n" +
                       "Notificaciones permitidas: " + notif + "\n" +
                       "Batería sin restricción: " + bat + "\n" +
