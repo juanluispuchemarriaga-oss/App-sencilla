@@ -1,4 +1,5 @@
 name: Crear APK
+
 on:
   push:
   workflow_dispatch:
@@ -124,7 +125,6 @@ jobs:
           import android.app.PendingIntent
           import android.content.Context
           import android.content.Intent
-          import android.os.Build
           import java.util.Calendar
 
           object Scheduler {
@@ -139,6 +139,15 @@ jobs:
                   )
               }
 
+              private fun pendingTest(ctx: Context): PendingIntent {
+                  val i = Intent(ctx, HourReceiver::class.java)
+                  i.putExtra("test", true)
+                  return PendingIntent.getBroadcast(
+                      ctx, 2, i,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+              }
+
               fun isOn(ctx: Context): Boolean =
                   ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ON, false)
 
@@ -146,23 +155,27 @@ jobs:
                   ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ON, on).apply()
               }
 
-              fun scheduleNext(ctx: Context) {
+              // Se programa como "alarma de reloj": es lo mas fiable, el sistema la respeta
+              // aunque el telefono este en reposo o la app este cerrada.
+              private fun setAt(ctx: Context, t: Long, p: PendingIntent) {
                   val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val show = PendingIntent.getActivity(
+                      ctx, 3, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  am.setAlarmClock(AlarmManager.AlarmClockInfo(t, show), p)
+              }
+
+              fun scheduleNext(ctx: Context) {
                   val c = Calendar.getInstance()
                   c.set(Calendar.MINUTE, 0)
                   c.set(Calendar.SECOND, 0)
                   c.set(Calendar.MILLISECOND, 0)
                   c.add(Calendar.HOUR_OF_DAY, 1)
-                  val t = c.timeInMillis
-                  try {
-                      if (Build.VERSION.SDK_INT >= 31 && !am.canScheduleExactAlarms()) {
-                          am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, t, pending(ctx))
-                      } else {
-                          am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, t, pending(ctx))
-                      }
-                  } catch (e: SecurityException) {
-                      am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, t, pending(ctx))
-                  }
+                  setAt(ctx, c.timeInMillis, pending(ctx))
+              }
+
+              fun scheduleTest(ctx: Context) {
+                  setAt(ctx, System.currentTimeMillis() + 60000, pendingTest(ctx))
               }
 
               fun cancel(ctx: Context) {
@@ -283,8 +296,11 @@ jobs:
           class HourReceiver : BroadcastReceiver() {
               override fun onReceive(context: Context, intent: Intent) {
                   val app = context.applicationContext
-                  if (!Scheduler.isOn(app)) return
-                  Scheduler.scheduleNext(app)
+                  val test = intent.getBooleanExtra("test", false)
+                  if (!test) {
+                      if (!Scheduler.isOn(app)) return
+                      Scheduler.scheduleNext(app)
+                  }
                   val pr = goAsync()
                   Announcer.run(app) { pr.finish() }
               }
@@ -314,12 +330,15 @@ jobs:
           import android.app.Activity
           import android.content.Intent
           import android.content.pm.PackageManager
+          import android.net.Uri
           import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
           import android.widget.Button
           import android.widget.LinearLayout
+          import android.widget.ScrollView
           import android.widget.TextView
+          import android.widget.Toast
 
           class MainActivity : Activity() {
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -342,8 +361,12 @@ jobs:
                   val btn = Button(this)
                   val prueba = Button(this)
                   prueba.text = "Probar ahora (voz + notificación)"
+                  val unMin = Button(this)
+                  unMin.text = "Probar en 1 minuto (sal de la app)"
                   val bateria = Button(this)
                   bateria.text = "Ajustes de batería (recomendado)"
+                  val ajustes = Button(this)
+                  ajustes.text = "Ajustes de la app (permisos)"
 
                   fun refrescar() {
                       if (Scheduler.isOn(this)) {
@@ -370,15 +393,31 @@ jobs:
                       Announcer.run(applicationContext) { }
                   }
 
+                  unMin.setOnClickListener {
+                      Scheduler.scheduleTest(this)
+                      Toast.makeText(this, "Sal de la app. En 1 minuto debe sonar.", Toast.LENGTH_LONG).show()
+                  }
+
                   bateria.setOnClickListener {
                       startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                  }
+
+                  ajustes.setOnClickListener {
+                      val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                      i.data = Uri.parse("package:" + packageName)
+                      startActivity(i)
                   }
 
                   layout.addView(estado)
                   layout.addView(btn)
                   layout.addView(prueba)
+                  layout.addView(unMin)
                   layout.addView(bateria)
-                  setContentView(layout)
+                  layout.addView(ajustes)
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(layout)
+                  setContentView(scroll)
                   refrescar()
               }
           }
