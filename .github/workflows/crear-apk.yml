@@ -1,5 +1,4 @@
 name: Crear APK
-
 on:
   push:
   workflow_dispatch:
@@ -8,6 +7,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -382,6 +383,17 @@ jobs:
               }
           }
           EOF
+
+      - name: Agregar icono
+        run: |
+          IMG=$(find . -maxdepth 1 -type f -size +0 \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) | head -n 1)
+          if [ -n "$IMG" ]; then
+            sudo apt-get install -y imagemagick
+            mkdir -p app/src/main/res/mipmap-xxxhdpi
+            if convert "$IMG" -gravity North -crop 1:1 +repage -resize 192x192 app/src/main/res/mipmap-xxxhdpi/ic_launcher.png; then
+              sed -i 's|android:label="Hora con Voz"|android:icon="@mipmap/ic_launcher" android:label="Hora con Voz"|' app/src/main/AndroidManifest.xml
+            fi
+          fi
 
       - name: Compilar APK
         run: gradle assembleDebug --no-daemon
