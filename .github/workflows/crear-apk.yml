@@ -89,6 +89,8 @@ jobs:
               <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32" />
               <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
               <queries>
                   <intent>
@@ -106,6 +108,15 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
+                  <service
+                      android:name=".KeepAliveService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="avisos de la hora" />
+                  </service>
 
                   <receiver android:name=".HourReceiver" android:exported="false" />
 
@@ -125,6 +136,7 @@ jobs:
           import android.app.PendingIntent
           import android.content.Context
           import android.content.Intent
+          import android.os.Build
           import java.util.Calendar
 
           object Scheduler {
@@ -176,6 +188,15 @@ jobs:
 
               fun scheduleTest(ctx: Context) {
                   setAt(ctx, System.currentTimeMillis() + 60000, pendingTest(ctx))
+              }
+
+              fun startService(ctx: Context) {
+                  val i = Intent(ctx, KeepAliveService::class.java)
+                  if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
+              }
+
+              fun stopService(ctx: Context) {
+                  ctx.stopService(Intent(ctx, KeepAliveService::class.java))
               }
 
               fun cancel(ctx: Context) {
@@ -300,9 +321,54 @@ jobs:
                   if (!test) {
                       if (!Scheduler.isOn(app)) return
                       Scheduler.scheduleNext(app)
+                      try { Scheduler.startService(app) } catch (e: Exception) { }
                   }
                   val pr = goAsync()
                   Announcer.run(app) { pr.finish() }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/horavoz/app/KeepAliveService.kt <<'EOF'
+          package com.horavoz.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+
+          class KeepAliveService : Service() {
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(
+                          NotificationChannel("servicio", "Avisos activos", NotificationManager.IMPORTANCE_LOW)
+                      )
+                  }
+                  val open = PendingIntent.getActivity(
+                      this, 4, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, "servicio")
+                          else Notification.Builder(this)
+                  b.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                  b.setContentTitle("Hora con Voz activo")
+                  b.setContentText("Te aviso cada hora en punto")
+                  b.setContentIntent(open)
+                  b.setOngoing(true)
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(2, b.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(2, b.build())
+                  }
+                  return START_STICKY
               }
           }
           EOF
@@ -318,6 +384,7 @@ jobs:
               override fun onReceive(context: Context, intent: Intent) {
                   if (Scheduler.isOn(context)) {
                       Scheduler.scheduleNext(context)
+                      try { Scheduler.startService(context) } catch (e: Exception) { }
                   }
               }
           }
@@ -382,9 +449,11 @@ jobs:
                       if (Scheduler.isOn(this)) {
                           Scheduler.setOn(this, false)
                           Scheduler.cancel(this)
+                      Scheduler.stopService(this)
                       } else {
                           Scheduler.setOn(this, true)
                           Scheduler.scheduleNext(this)
+                      Scheduler.startService(this)
                       }
                       refrescar()
                   }
@@ -418,6 +487,7 @@ jobs:
                   val scroll = ScrollView(this)
                   scroll.addView(layout)
                   setContentView(scroll)
+                  if (Scheduler.isOn(this)) { try { Scheduler.startService(this) } catch (e: Exception) { } }
                   refrescar()
               }
           }
@@ -426,18 +496,4 @@ jobs:
       - name: Agregar icono
         run: |
           IMG=$(find . -maxdepth 1 -type f -size +0 \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) | head -n 1)
-          if [ -n "$IMG" ]; then
-            sudo apt-get install -y imagemagick
-            mkdir -p app/src/main/res/mipmap-xxxhdpi
-            if convert "$IMG" -gravity North -crop 1:1 +repage -resize 192x192 app/src/main/res/mipmap-xxxhdpi/ic_launcher.png; then
-              sed -i 's|android:label="Hora con Voz"|android:icon="@mipmap/ic_launcher" android:label="Hora con Voz"|' app/src/main/AndroidManifest.xml
-            fi
-          fi
-
-      - name: Compilar APK
-        run: gradle assembleDebug --no-daemon
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: HoraConVoz-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          if [ -n "$IMG" 
