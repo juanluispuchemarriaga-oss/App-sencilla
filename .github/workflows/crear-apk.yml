@@ -496,4 +496,20 @@ jobs:
       - name: Agregar icono
         run: |
           IMG=$(find . -maxdepth 1 -type f -size +0 \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) | head -n 1)
-          if [ -n "$IMG" 
+          if [ -n "$IMG" ]; then
+            sudo apt-get install -y imagemagick
+            mkdir -p app/src/main/res/mipmap-xxxhdpi
+            if convert "$IMG" -gravity North -crop 1:1 +repage -resize 192x192 app/src/main/res/mipmap-xxxhdpi/ic_launcher.png; then
+              sed -i 's|android:label="Hora con Voz"|android:icon="@mipmap/ic_launcher" android:label="Hora con Voz"|' app/src/main/AndroidManifest.xml
+            fi
+          fi
+
+      - name: Compilar APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HoraConVoz-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+# FIN DEL ARCHIVO
