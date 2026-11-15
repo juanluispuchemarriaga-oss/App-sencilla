@@ -1,0 +1,392 @@
+name: Crear APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Crear archivos del proyecto
+        run: |
+          mkdir -p app/src/main/java/com/horavoz/app
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "HoraConVoz"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.horavoz.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.horavoz.app"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:label="Hora con Voz"
+                  android:theme="@android:style/Theme.Material.Light">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver android:name=".HourReceiver" android:exported="false" />
+
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/horavoz/app/Scheduler.kt <<'EOF'
+          package com.horavoz.app
+
+          import android.app.AlarmManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import java.util.Calendar
+
+          object Scheduler {
+              private const val PREFS = "horavoz"
+              private const val KEY_ON = "activo"
+
+              private fun pending(ctx: Context): PendingIntent {
+                  val i = Intent(ctx, HourReceiver::class.java)
+                  return PendingIntent.getBroadcast(
+                      ctx, 1, i,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+              }
+
+              fun isOn(ctx: Context): Boolean =
+                  ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ON, false)
+
+              fun setOn(ctx: Context, on: Boolean) {
+                  ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ON, on).apply()
+              }
+
+              fun scheduleNext(ctx: Context) {
+                  val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val c = Calendar.getInstance()
+                  c.set(Calendar.MINUTE, 0)
+                  c.set(Calendar.SECOND, 0)
+                  c.set(Calendar.MILLISECOND, 0)
+                  c.add(Calendar.HOUR_OF_DAY, 1)
+                  val t = c.timeInMillis
+                  try {
+                      if (Build.VERSION.SDK_INT >= 31 && !am.canScheduleExactAlarms()) {
+                          am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, t, pending(ctx))
+                      } else {
+                          am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, t, pending(ctx))
+                      }
+                  } catch (e: SecurityException) {
+                      am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, t, pending(ctx))
+                  }
+              }
+
+              fun cancel(ctx: Context) {
+                  val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  am.cancel(pending(ctx))
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/horavoz/app/Announcer.kt <<'EOF'
+          package com.horavoz.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import android.media.AudioAttributes
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import java.util.Calendar
+          import java.util.Locale
+          import java.util.concurrent.atomic.AtomicBoolean
+
+          object Announcer {
+
+              fun phrase(): String {
+                  val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+                  val nombres = arrayOf(
+                      "doce", "una", "dos", "tres", "cuatro", "cinco",
+                      "seis", "siete", "ocho", "nueve", "diez", "once"
+                  )
+                  val n = nombres[h % 12]
+                  val verbo = if (h % 12 == 1) "Es la" else "Son las"
+                  val momento = when (h) {
+                      0 -> "de la noche"
+                      in 1..5 -> "de la madrugada"
+                      in 6..11 -> "de la mañana"
+                      12 -> "del mediodía"
+                      in 13..19 -> "de la tarde"
+                      else -> "de la noche"
+                  }
+                  return "$verbo $n $momento"
+              }
+
+              fun run(ctx: Context, done: () -> Unit) {
+                  val text = phrase()
+                  notify(ctx, text)
+                  speak(ctx, text, done)
+              }
+
+              private fun notify(ctx: Context, text: String) {
+                  val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(
+                          NotificationChannel("hora", "Aviso de la hora", NotificationManager.IMPORTANCE_HIGH)
+                      )
+                  }
+                  val open = PendingIntent.getActivity(
+                      ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(ctx, "hora")
+                          else Notification.Builder(ctx)
+                  b.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                  b.setContentTitle("Hora")
+                  b.setContentText(text)
+                  b.setContentIntent(open)
+                  b.setAutoCancel(true)
+                  nm.notify(1, b.build())
+              }
+
+              private fun speak(ctx: Context, text: String, done: () -> Unit) {
+                  val finished = AtomicBoolean(false)
+                  var tts: TextToSpeech? = null
+                  val finish = {
+                      if (finished.compareAndSet(false, true)) {
+                          try { tts?.shutdown() } catch (e: Exception) { }
+                          done()
+                      }
+                  }
+                  Handler(Looper.getMainLooper()).postDelayed({ finish() }, 9000)
+                  tts = TextToSpeech(ctx) { status ->
+                      val t = tts
+                      if (status == TextToSpeech.SUCCESS && t != null) {
+                          t.language = Locale("es")
+                          t.setAudioAttributes(
+                              AudioAttributes.Builder()
+                                  .setUsage(AudioAttributes.USAGE_MEDIA)
+                                  .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                  .build()
+                          )
+                          t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                              override fun onStart(utteranceId: String?) {}
+                              override fun onDone(utteranceId: String?) { finish() }
+                              @Deprecated("Deprecated in Java")
+                              override fun onError(utteranceId: String?) { finish() }
+                          })
+                          t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "hora")
+                      } else {
+                          finish()
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/horavoz/app/HourReceiver.kt <<'EOF'
+          package com.horavoz.app
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class HourReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  val app = context.applicationContext
+                  if (!Scheduler.isOn(app)) return
+                  Scheduler.scheduleNext(app)
+                  val pr = goAsync()
+                  Announcer.run(app) { pr.finish() }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/horavoz/app/BootReceiver.kt <<'EOF'
+          package com.horavoz.app
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  if (Scheduler.isOn(context)) {
+                      Scheduler.scheduleNext(context)
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/horavoz/app/MainActivity.kt <<'EOF'
+          package com.horavoz.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+
+                  val layout = LinearLayout(this)
+                  layout.orientation = LinearLayout.VERTICAL
+                  layout.setPadding(48, 120, 48, 48)
+
+                  val estado = TextView(this)
+                  estado.textSize = 22f
+                  estado.setPadding(0, 0, 0, 48)
+
+                  val btn = Button(this)
+                  val prueba = Button(this)
+                  prueba.text = "Probar ahora (voz + notificación)"
+                  val bateria = Button(this)
+                  bateria.text = "Ajustes de batería (recomendado)"
+
+                  fun refrescar() {
+                      if (Scheduler.isOn(this)) {
+                          estado.text = "✅ Avisos ACTIVADOS\nTe aviso cada hora en punto."
+                          btn.text = "Desactivar avisos"
+                      } else {
+                          estado.text = "⏸️ Avisos APAGADOS"
+                          btn.text = "Activar avisos"
+                      }
+                  }
+
+                  btn.setOnClickListener {
+                      if (Scheduler.isOn(this)) {
+                          Scheduler.setOn(this, false)
+                          Scheduler.cancel(this)
+                      } else {
+                          Scheduler.setOn(this, true)
+                          Scheduler.scheduleNext(this)
+                      }
+                      refrescar()
+                  }
+
+                  prueba.setOnClickListener {
+                      Announcer.run(applicationContext) { }
+                  }
+
+                  bateria.setOnClickListener {
+                      startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                  }
+
+                  layout.addView(estado)
+                  layout.addView(btn)
+                  layout.addView(prueba)
+                  layout.addView(bateria)
+                  setContentView(layout)
+                  refrescar()
+              }
+          }
+          EOF
+
+      - name: Compilar APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HoraConVoz-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
